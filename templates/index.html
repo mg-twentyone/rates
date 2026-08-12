@@ -1,34 +1,35 @@
 <!DOCTYPE html>
 <html data-theme="dark" data-webp="true" lang="en">
-<link rel="stylesheet" href="/static/pico.min.css" />
-<link rel="stylesheet" href="/static/css/themes/amber.css">
-
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flexboxgrid/6.3.1/flexboxgrid.min.css"
-  type="text/css">
-<link rel="icon" type="image/png" sizes="32x32" href="/static/images/favicon.png">
 
 <head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta charset="utf-8">
-  
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{{ title }}</title>
+
+  <link rel="stylesheet" href="/static/pico.min.css" />
+  <link rel="stylesheet" href="/static/css/themes/amber.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flexboxgrid/6.3.1/flexboxgrid.min.css"
+    type="text/css">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/images/favicon.png">
 </head>
 
 <body style="background-color: #10182B;">
   <!-- Nav -->
   <nav class="container-fluid" style="border-bottom-style:solid; border-color: rgb(66, 66, 66); border-width: 0.1px">
-  <ul>
-    <a href="https://plebnet.dev/">
-      <img src="/static/images/plebnet-wide.png" height="64" width="180"
-      alt="PLEBNET.DEV" />
-    </a>
-  </ul>
+    <ul>
+      <a href="https://plebnet.dev/">
+        <img src="/static/images/plebnet-wide.png" height="64" width="180" alt="PLEBNET.DEV" />
+      </a>
+    </ul>
     <ul>
       <li>
         <a class="secondary" href="https://plebnet.dev/">Home</a>
       </li>
       <li>
         <a class="secondary" href="https://plebnet.dev/resources">Resources</a>
+      </li>
+      <li>
+        <a class="secondary" href="/docs">API</a>
       </li>
     </ul>
   </nav><!-- ./ Nav -->
@@ -38,19 +39,20 @@
       <h1 style="color:#ffb300">
         <a href="/">{{ title }}</a>
       </h1>
-      <p>A Basic Bitcoin to Fiat converter with price feeds from Coindesk.</p>
+      <p>A basic Bitcoin-to-fiat converter, powered by live CoinGecko price data.</p>
     </hgroup>
 
     <section id="converter">
       <div class="grid">
         <div class="row center-sm">
           <div class="col-sm-4">
-            <button class="primary outline" name="swap">Sats</button>
+            <button class="primary outline" type="button" name="swap" title="Swap coming soon" aria-disabled="true">Sats</button>
           </div>
           <div class="col-sm-6">
-            <input style="background-color:#10182B" onclick="clearInput()" type="text" id="satsamt" name="satsamt" placeholder="1000" aria-label="sats" value="{{satsamt}}">
+            <input style="background-color:#10182B" onclick="clearInput()" type="text" id="satsamt"
+              name="satsamt" placeholder="1000" aria-label="sats" value="{{satsamt}}">
           </div>
-          </div>
+        </div>
         <div class="row center-sm">
           <div class="col-sm-4">
             <form id="my-form" action="btc" method="post">
@@ -66,7 +68,8 @@
             </form>
           </div>
           <div class="col-sm-6">
-            <input style="background-color:#10182B"  onclick="clearFiat()" type="text" name="fiat" id="fiat" aria-label="fiat" value="{{fiat}}" />
+            <input style="background-color:#10182B" onclick="clearFiat()" type="text" name="fiat" id="fiat"
+              aria-label="fiat" value="{{fiat}}" />
           </div>
         </div>
       </div>
@@ -84,14 +87,14 @@
 
     <section id="ticker">
       <p>
-        <b> Moscow Time </b> {{ moscow }} (sats/{{fiattype}}) <br />
-        <b> Block Height </b> {{ blockheight }} <br />
-        As of {{lastupdated}} <br />
+        <b>Moscow Time</b> {{ moscow }} (sats/{{fiattype}}) <br />
+        <b>Block Height</b> {{ blockheight if blockheight is not none else "unavailable" }} <br />
+        As of <span id="last-updated">{{ lastupdated }}</span> <br />
       </p>
     </section>
     <footer>
       Built with <a href="https://picocss.com"> Pico </a> • <a href="https://github.com/plebnet-dev/rates">
-        Source </a>
+        Source </a> • <a href="/docs">API docs</a>
     </footer>
   </main>
 
@@ -102,8 +105,23 @@
     const satsamt = document.getElementById('satsamt')
     const satlabel = document.getElementById('sats-label')
     const btclabel = document.getElementById('btc-label')
+    const lastUpdatedEl = document.getElementById('last-updated')
 
-    const rate = fiatamt.value.replace(",", "") // 1 btc = fiat amt (and removing the format added initially in app.py since further conversion needs to happen.)
+    const rate = fiatamt.value.replace(",", "")
+
+    (function formatLastUpdated() {
+      const raw = lastUpdatedEl.textContent.trim();
+      const epochSeconds = Number(raw);
+      if (!raw || Number.isNaN(epochSeconds)) {
+        lastUpdatedEl.textContent = "unavailable";
+        return;
+      }
+      const date = new Date(epochSeconds * 1000);
+      lastUpdatedEl.textContent = date.toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+    })();
 
     function clearInput() {
       document.getElementById("satsamt").value = "";
@@ -114,7 +132,6 @@
 
 
     dropdown.addEventListener('change', () => {
-      console.log(dropdown.value)
       form.submit();
     })
 
@@ -127,10 +144,9 @@
         event.target.value = userInput.slice(0, -1);
       }
       const result = parseFloat(userInput) / rate * 100000000;  // convert btc to fiat rate
-      //console.log("fiat section: " , rate)
-      satsamt.value = result.toLocaleString(undefined, { minimumFractionDigits: 0 }); 
+      satsamt.value = result.toLocaleString(undefined, { minimumFractionDigits: 0 });
       satlabel.innerHTML = satsamt.value;
-      btclabel.innerHTML = (parseFloat(userInput) / rate).toLocaleString(undefined, {minimumFractionDigits: 5});
+      btclabel.innerHTML = (parseFloat(userInput) / rate).toLocaleString(undefined, { minimumFractionDigits: 5 });
     });
 
     // btc input section
@@ -142,15 +158,11 @@
         event.target.value = userInput.slice(0, -1);
       }
       const result = parseFloat(userInput) * rate / 100000000;  // convert sats to fiat rate
-      //console.log("btc section: ", rate)
-      fiatamt.value = result.toLocaleString(undefined, { minimumFractionDigits: 2 });   
-      satsvalue= parseFloat(userInput); // * 100000000;
+      fiatamt.value = result.toLocaleString(undefined, { minimumFractionDigits: 2 });
+      const satsvalue = parseFloat(userInput);
       satlabel.innerHTML = satsvalue.toLocaleString(undefined, { minimumFractionDigits: 0 });
-      btclabel.innerHTML = parseFloat(satsvalue / 100000000).toLocaleString(undefined, {minimumFractionDigits: 5});
-
+      btclabel.innerHTML = parseFloat(satsvalue / 100000000).toLocaleString(undefined, { minimumFractionDigits: 5 });
     });
-
-
   </script>
 
 </body>
