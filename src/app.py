@@ -1,35 +1,121 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.templating import Jinja2Templates
+import asyncio
+import logging
+import time
+from typing import Dict, Optional, Tuple
+
+import httpx
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import starlette.status as status
 
-from locale import atof, setlocale, LC_NUMERIC
-import logging
-import requests
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sats_converter")
 
-def get_block_height():
-    url = "https://api.blockchair.com/bitcoin/stats"
-    res = requests.get(url)
-    data = res.json()
-    height = data['data']['best_block_height']
-    return height
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+BLOCKCHAIR_URL = "https://api.blockchair.com/bitcoin/stats"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+REQUEST_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+CACHE_TTL_SECONDS = 20  # the keyless CoinGecko API is rate-limited; cache briefly
+
+FIAT_LIST = [
+    "USD", "EUR", "JPY", "CAD", "AUD", "GBP", "PLN",
+    "CHF", "HKD", "CNY", "SGD", "TWD", "THB", "KRW",
+    "BRL", "RUB", "TRY",
+]
+FIAT_SET = {c.lower() for c in FIAT_LIST}
+
+SATS_PER_BTC = 100_000_000
 
 
-def coindesk_btc_fiat(symbol):
-    # batch the requests together via asyncio or multiprocessing
-    setlocale(LC_NUMERIC, '')
-    url = f'https://data-api.coindesk.com/index/cc/v1/latest/tick?market=cadli&instruments={symbol}'
-    response = requests.get(url)
-    object = response.json()
+# ---------------------------------------------------------------------------
+# Tiny in-memory TTL cache (per-process). Fine for a single instance;
+# swap for Redis/memcached if you ever run multiple workers/instances.
+# ---------------------------------------------------------------------------
 
-    data = object['Data'][symbol]
-    time = data["VALUE_LAST_UPDATE_TS"]
-    rate = data['VALUE']
+_cache: Dict[str, Tuple[float, object]] = {}
 
-    return time, rate
 
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if time.monotonic() - ts > CACHE_TTL_SECONDS:
+        _cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value) -> None:
+    _cache[key] = (time.monotonic(), value)
+
+
+# ---------------------------------------------------------------------------
+# External API calls
+# ---------------------------------------------------------------------------
+
+class UpstreamError(Exception):
+    """Raised when an upstream API call fails or returns unexpected data."""
+
+
+async def get_block_height(client: httpx.AsyncClient) -> Optional[int]:
+    """Non-critical: page should still render if this fails."""
+    cached = _cache_get("block_height")
+    if cached is not None:
+        return cached
+    try:
+        res = await client.get(BLOCKCHAIR_URL, timeout=REQUEST_TIMEOUT)
+        res.raise_for_status()
+        height = res.json()["data"]["best_block_height"]
+        _cache_set("block_height", height)
+        return height
+    except (httpx.HTTPError, KeyError, TypeError) as e:
+        logger.warning("get_block_height failed: %s", e)
+        return None
+
+
+async def coingecko_btc_fiat(client: httpx.AsyncClient, currency: str) -> Tuple[int, float]:
+    """
+    Return (unix_timestamp, btc_price) for BTC priced in `currency`
+    (a 3-letter fiat code, case-insensitive, e.g. 'usd').
+    """
+    currency = currency.lower()
+    if currency not in FIAT_SET:
+        raise UpstreamError(f"Unsupported currency: {currency}")
+
+    cache_key = f"btc_{currency}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "ids": "bitcoin",
+        "vs_currencies": currency,
+        "include_last_updated_at": "true",
+    }
+    try:
+        response = await client.get(COINGECKO_URL, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        rate = data["bitcoin"][currency]
+        timestamp = data["bitcoin"]["last_updated_at"]
+    except (httpx.HTTPError, KeyError, TypeError) as e:
+        raise UpstreamError(f"Failed to fetch BTC/{currency.upper()} rate") from e
+
+    result = (timestamp, rate)
+    _cache_set(cache_key, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 
 title = "sats converter"
 description = "simple web app to convert fiat to btc"
@@ -38,14 +124,8 @@ app = FastAPI(
     title=title,
     description=description,
     version="0.0.1 alpha",
-    contact={
-        "name": "bitkarrot",
-        "url": "http://github.com/bitkarrot",
-    },
-    license_info={
-        "name": "MIT License",
-        "url": "https://mit-license.org/",
-    },
+    contact={"name": "bitkarrot", "url": "http://github.com/bitkarrot"},
+    license_info={"name": "MIT License", "url": "https://mit-license.org/"},
 )
 
 origins = [
@@ -63,122 +143,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name='static')
-templates = Jinja2Templates(directory='templates/')
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates/")
 
-fiatlist = ['USD', 'EUR', 'JPY', 'CAD', 'AUD', 'GBP', 'PLN',
-            'CHF', 'HKD', 'CNY', 'SGD', 'TWD', 'THB', 'KRW', 
-            'BRL', 'RUB', 'TRY']
 
-# initial get for index page
+@app.on_event("startup")
+async def startup() -> None:
+    app.state.http_client = httpx.AsyncClient()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await app.state.http_client.aclose()
+
+
+def _format_fiat(amount: float) -> str:
+    return "{:,.2f}".format(float(amount))
+
+
+async def _render_index(request: Request, currency: str):
+    client: httpx.AsyncClient = app.state.http_client
+    currency = currency.upper()
+
+    # Fetch price + block height concurrently instead of sequentially.
+    (timestamp, rate), height = await asyncio.gather(
+        coingecko_btc_fiat(client, currency),
+        get_block_height(client),
+    )
+
+    return templates.TemplateResponse(
+        "index.html",
+        context={
+            "request": request,
+            "title": "Sats Converter",
+            "fiat": _format_fiat(rate),
+            "fiattype": currency,
+            "fiatlist": FIAT_LIST,
+            "satsamt": SATS_PER_BTC,
+            "moscow": int(SATS_PER_BTC / rate),
+            "blockheight": height,
+            "lastupdated": timestamp,
+        },
+    )
+
+
 @app.get("/")
 async def initial_page(request: Request):
+    try:
+        return await _render_index(request, "USD")
+    except UpstreamError as e:
+        logger.error(e)
+        raise HTTPException(status_code=502, detail=str(e))
 
-    satsamt = 100000000
-    currency = 'USD'
-    symbol = 'BTC-'+currency
-    time, rate = coindesk_btc_fiat(symbol)
-    btcusd = "%.2f" % (rate)
-    moscowtime = int(100000000/float(btcusd))
-    height = get_block_height()
-    btcusd = "{:,}".format(float(btcusd)) #formatting with commas
-
-    return templates.TemplateResponse("index.html",
-                                      context={
-                                          'request': request,
-                                          'title': "Sats Converter",
-                                          'fiat': btcusd,
-                                          'fiattype': currency,
-                                          'fiatlist': fiatlist,
-                                          'satsamt': satsamt,
-                                          'moscow': moscowtime,
-                                          'blockheight': height,
-                                          'lastupdated': time})
 
 @app.get("/btc")
 async def redirectpage(request: Request):
-    return RedirectResponse('/', status_code=status.HTTP_302_FOUND)
+    return RedirectResponse("/", status_code=status.HTTP_302_FOUND)
 
 
-# for btc page
 @app.post("/btc")
-async def submit_form(request: Request, selected: str = Form(...)):     # trunk-ignore(ruff/B008)
+async def submit_form(request: Request, selected: str = Form(...)):  # trunk-ignore(ruff/B008)
+    selected = (selected or "").upper()
+    if selected not in FIAT_LIST:
+        raise HTTPException(status_code=400, detail=f"Unsupported currency: {selected}")
+
     try:
-        if selected is None:
-            return RedirectResponse('/', status_code=status.HTTP_302_FOUND)
+        return await _render_index(request, selected)
+    except UpstreamError as e:
+        logger.error(e)
+        raise HTTPException(status_code=502, detail=str(e))
 
-        symbol = 'BTC-'+selected
-        time, rate = coindesk_btc_fiat(symbol)
-        btcfiat = "%.2f" % rate
-        moscowtime = int(100000000/float(btcfiat))
-        height = get_block_height()
-        btcfiat = "{:,}".format(float(btcfiat))  #formatting with commas
-        satsamt = 100000000
-
-
-        return templates.TemplateResponse("index.html",
-                                          context={
-                                              'request': request,
-                                              'fiattype': selected,
-                                              'fiat': btcfiat,
-                                              'fiatlist': fiatlist,
-                                              'satsamt': satsamt,
-                                              'moscow': moscowtime,
-                                              'blockheight': height,
-                                              'lastupdated': time,
-                                              'title': "Sats Converter"})
-    except Exception as e:
-        logging.error(e)
 
 @app.get("/rate")
 async def get_rate(pair: str):
     """
-    Retrieve the exchange rate between BTC/SAT to any given pair and viceversa
+    Retrieve the exchange rate between BTC/SAT and any supported fiat currency.
 
     Parameters:
-        - **param1** (str)
-        eg: btcusd, usdbtc, sathkd, eursat
+        - **pair** (str): 6-character pair, e.g. btcusd, usdbtc, sathkd, eursat
 
     Returns:
-        dict: {"rate":"1200.35"}
+        dict: {"rate": "1200.35"}
     """
-    lenOfpair = len(pair)
-    if lenOfpair != 6:
-        return {"error": "Currency not found"}
-    if 'btc' in pair:
-        currency1 = pair[:3]
-        currency2 = pair[3:]
-        currency, inverse, sat = (currency2, False, False) if currency1 == "btc" else (currency1, True, False)
-    elif 'sat' in pair:
-        currency1 = pair[:3]
-        currency2 = pair[3:]
-        currency, inverse, sat = (currency2, False, True) if currency1 == "sat" else (currency1, True, True)
+    pair = pair.lower().strip()
+    if len(pair) != 6:
+        return {"error": "Currency pair must be 6 characters, e.g. 'btcusd'"}
+
+    left, right = pair[:3], pair[3:]
+
+    if left == "btc":
+        currency, inverse, sat = right, False, False
+    elif right == "btc":
+        currency, inverse, sat = left, True, False
+    elif left == "sat":
+        currency, inverse, sat = right, False, True
+    elif right == "sat":
+        currency, inverse, sat = left, True, True
+    else:
+        return {"error": "Pair must include 'btc' or 'sat', e.g. 'btcusd' or 'sathkd'"}
+
+    if currency not in FIAT_SET:
+        return {"error": f"Currency not found: {currency}"}
+
     try:
-        if currency is None:
-            return RedirectResponse('/', status_code=status.HTTP_302_FOUND)
-        
-        symbol = (currency1+'-'+currency2).upper()
-        _, rate = coindesk_btc_fiat(symbol)
+        client: httpx.AsyncClient = app.state.http_client
+        # NOTE: always fetch the real BTC-<currency> rate; never build the
+        # symbol from the raw pair text (that was the bug for e.g. 'eursat').
+        _, rate = await coingecko_btc_fiat(client, currency)
 
-        if not inverse and not sat:
-            btcfiat = "%.2f" % rate
+        if not inverse and not sat:      # e.g. btcusd -> price of 1 BTC
+            value = "%.2f" % rate
+        elif inverse and not sat:        # e.g. usdbtc -> price of 1 unit in BTC
+            value = format(1 / rate, ".8f")
+        elif not inverse and sat:        # e.g. sathkd -> price of 1 sat
+            value = format(rate / SATS_PER_BTC, ".8f")
+        else:                            # e.g. eursat -> sats per 1 unit
+            value = format(SATS_PER_BTC / rate, ".2f")
 
-        if inverse and not sat:
-            btcfiat = 1/rate
-            btcfiat = format(btcfiat, '.8f')
+        return {"rate": value}
 
-        if not inverse and sat:
-            btcfiat = rate/10**8
-            btcfiat = format(btcfiat, '.8f')
-
-        if inverse and sat:
-            btcfiat = (10**8)/rate
-            btcfiat = format(btcfiat, '.2f')
-
-        data = {"rate" : btcfiat}
-        return data
-    
-    except Exception as e:
-        logging.error(e)
+    except UpstreamError as e:
+        logger.error(e)
         return {"error": "Failed to fetch exchange rate"}
-        
