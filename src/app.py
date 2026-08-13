@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Dict, Optional, Tuple
 
 import httpx
@@ -11,7 +12,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import starlette.status as status
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sats_converter")
 
 # ---------------------------------------------------------------------------
@@ -21,7 +21,7 @@ logger = logging.getLogger("sats_converter")
 BLOCKCHAIR_URL = "https://api.blockchair.com/bitcoin/stats"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 REQUEST_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
-CACHE_TTL_SECONDS = 20  # the keyless CoinGecko API is rate-limited; cache briefly
+CACHE_TTL_SECONDS = 20  # keyless CoinGecko API is rate-limited; cache briefly
 
 FIAT_LIST = [
     "USD", "EUR", "JPY", "CAD", "AUD", "GBP", "PLN",
@@ -34,8 +34,7 @@ SATS_PER_BTC = 100_000_000
 
 
 # ---------------------------------------------------------------------------
-# Tiny in-memory TTL cache (per-process). Fine for a single instance;
-# swap for Redis/memcached if you ever run multiple workers/instances.
+# Tiny in-memory TTL cache (per-process).
 # ---------------------------------------------------------------------------
 
 _cache: Dict[str, Tuple[float, object]] = {}
@@ -117,27 +116,30 @@ async def coingecko_btc_fiat(client: httpx.AsyncClient, currency: str) -> Tuple[
 # App setup
 # ---------------------------------------------------------------------------
 
-title = "sats converter"
-description = "simple web app to convert fiat to btc"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = httpx.AsyncClient()
+    yield
+    await app.state.http_client.aclose()
+
 
 app = FastAPI(
-    title=title,
-    description=description,
+    title="sats converter",
+    description="simple web app to convert fiat to btc",
     version="0.0.1 alpha",
     contact={"name": "bitkarrot", "url": "http://github.com/bitkarrot"},
     license_info={"name": "MIT License", "url": "https://mit-license.org/"},
+    lifespan=lifespan,
 )
-
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://localhost:5000",
-    "http://localhost:8000",
-]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:3000",
+        "http://localhost:5000",
+        "http://localhost:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -145,16 +147,6 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates/")
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    app.state.http_client = httpx.AsyncClient()
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await app.state.http_client.aclose()
 
 
 def _format_fiat(amount: float) -> str:
@@ -165,7 +157,6 @@ async def _render_index(request: Request, currency: str):
     client: httpx.AsyncClient = app.state.http_client
     currency = currency.upper()
 
-    # Fetch price + block height concurrently instead of sequentially.
     (timestamp, rate), height = await asyncio.gather(
         coingecko_btc_fiat(client, currency),
         get_block_height(client),
@@ -187,13 +178,17 @@ async def _render_index(request: Request, currency: str):
     )
 
 
-@app.get("/")
-async def initial_page(request: Request):
+async def _render_index_or_502(request: Request, currency: str):
     try:
-        return await _render_index(request, "USD")
+        return await _render_index(request, currency)
     except UpstreamError as e:
         logger.error(e)
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/")
+async def initial_page(request: Request):
+    return await _render_index_or_502(request, "USD")
 
 
 @app.get("/btc")
@@ -202,16 +197,11 @@ async def redirectpage(request: Request):
 
 
 @app.post("/btc")
-async def submit_form(request: Request, selected: str = Form(...)):  # trunk-ignore(ruff/B008)
+async def submit_form(request: Request, selected: str = Form(...)):
     selected = (selected or "").upper()
     if selected not in FIAT_LIST:
         raise HTTPException(status_code=400, detail=f"Unsupported currency: {selected}")
-
-    try:
-        return await _render_index(request, selected)
-    except UpstreamError as e:
-        logger.error(e)
-        raise HTTPException(status_code=502, detail=str(e))
+    return await _render_index_or_502(request, selected)
 
 
 @app.get("/rate")
@@ -247,17 +237,16 @@ async def get_rate(pair: str):
 
     try:
         client: httpx.AsyncClient = app.state.http_client
-        # NOTE: always fetch the real BTC-<currency> rate; never build the
-        # symbol from the raw pair text (that was the bug for e.g. 'eursat').
+        # NOTE: fetch BTC-<currency> rate.
         _, rate = await coingecko_btc_fiat(client, currency)
 
-        if not inverse and not sat:      # e.g. btcusd -> price of 1 BTC
+        if not inverse and not sat:
             value = "%.2f" % rate
-        elif inverse and not sat:        # e.g. usdbtc -> price of 1 unit in BTC
+        elif inverse and not sat:
             value = format(1 / rate, ".8f")
-        elif not inverse and sat:        # e.g. sathkd -> price of 1 sat
+        elif not inverse and sat:
             value = format(rate / SATS_PER_BTC, ".8f")
-        else:                            # e.g. eursat -> sats per 1 unit
+        else:
             value = format(SATS_PER_BTC / rate, ".2f")
 
         return {"rate": value}
